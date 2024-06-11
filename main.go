@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -45,7 +44,18 @@ type TableHash struct {
 	Hash  string
 }
 
-func getTableHash(db *sql.DB, tableName string) (*TableHash, error) {
+func getMinMax(db *sql.DB, name string) (int64, int64, error) {
+	query := fmt.Sprintf("SELECT MIN(id), MAX(id) FROM %s", name)
+	row := db.QueryRow(query)
+	var minId, maxId int64
+	err := row.Scan(&minId, &maxId)
+	if err != nil {
+		return 0, 0, err
+	}
+	return minId, maxId, nil
+}
+
+func getTableHash(db *sql.DB, tableName string, minId int64, maxId int64) (*TableHash, error) {
 	columns, err := getColumnNames(db, tableName)
 	if err != nil {
 		return nil, err
@@ -56,9 +66,10 @@ func getTableHash(db *sql.DB, tableName string) (*TableHash, error) {
 		SELECT 
 			COUNT(*),
 			SUM(CAST(CONV(SUBSTRING(MD5(CONCAT_WS(%s)), 18), 16, 10) AS UNSIGNED)) AS hash
-		FROM %s`, concatColumns, tableName)
-
-	println(newQuery)
+		FROM %s
+		WHERE id >= %d AND id <= %d
+		ORDER BY id
+		`, concatColumns, tableName, minId, maxId)
 
 	resultRow := db.QueryRow(newQuery)
 	var count int
@@ -79,6 +90,69 @@ func NewDb(name string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPass, dbHost, dbPort, name)
 
 	return sql.Open("mysql", dsn)
+}
+
+func compareRows(dbSource *sql.DB, dbTarget *sql.DB, tableName string, minId int64, maxId int64) []int64 {
+	columns, err := getColumnNames(dbSource, tableName)
+	if err != nil {
+		log.Fatalf("Error getting column names: %v\n", err)
+	}
+
+	concatColumns := strings.Join(columns, ", ")
+	query := fmt.Sprintf("SELECT id, CAST(CONV(SUBSTRING(MD5(CONCAT_WS(%s)), 18), 16, 10) AS UNSIGNED) AS hash FROM %s WHERE id >= %d AND id <= %d", concatColumns, tableName, minId, maxId)
+	sourceRows, err := dbSource.Query(query)
+	if err != nil {
+		log.Fatalf("Error querying the database: %v\n", err)
+	}
+	defer func(rows *sql.Rows) {
+		err := rows.Close()
+		if err != nil {
+			log.Fatalf("Error closing rows: %v\n", err)
+		}
+	}(sourceRows)
+
+	targetRows, err := dbTarget.Query(query)
+	if err != nil {
+		log.Fatalf("Error querying the database: %v\n", err)
+	}
+	defer func(rows *sql.Rows) {
+		err := rows.Close()
+		if err != nil {
+			log.Fatalf("Error closing rows: %v\n", err)
+		}
+	}(targetRows)
+
+	sourceRowHashes := make(map[int64]string)
+
+	for sourceRows.Next() {
+		var sourceId int64
+		var hash string
+		err = sourceRows.Scan(&sourceId, &hash)
+		if err != nil {
+			log.Fatalf("Error scanning source rows: %v\n", err)
+		}
+		sourceRowHashes[sourceId] = hash
+	}
+
+	ids := make([]int64, 0)
+
+	for targetRows.Next() {
+		var targetId int64
+		var hash string
+		err = targetRows.Scan(&targetId, &hash)
+		if err != nil {
+			log.Fatalf("Error scanning target rows: %v\n", err)
+		}
+		sourceHash, ok := sourceRowHashes[targetId]
+		if !ok {
+			ids = append(ids, targetId)
+			continue
+		}
+		if sourceHash != hash {
+			ids = append(ids, targetId)
+		}
+	}
+	return ids
 }
 
 func main() {
@@ -113,21 +187,33 @@ func main() {
 		log.Fatalf("Error connecting to the database: %v\n", err)
 	}
 
-	tableNames := os.Args[1:]
+	tableNames := []string{"reference"}
 
 	for _, tableName := range tableNames {
-		sourceTableHash, err := getTableHash(dbSource, tableName)
+		var chunkSize int64 = 10000
+
+		sourceMinId, sourceMaxId, err := getMinMax(dbSource, tableName)
 		if err != nil {
-			log.Fatalf("Error getting table hash: %v\n", err)
-		}
-		targetTableHash, err := getTableHash(dbTarget, tableName)
-		if err != nil {
-			log.Fatalf("Error getting table hash: %v\n", err)
+			log.Fatalf("Error getting min and max id: %v\n", err)
 		}
 
-		if sourceTableHash.Hash != targetTableHash.Hash {
-			fmt.Printf("%s %s %d %s\n", "ribosom", tableName, sourceTableHash.Count, sourceTableHash.Hash)
-			fmt.Printf("%s %s %d %s\n", "ribosom_sync", tableName, targetTableHash.Count, targetTableHash.Hash)
+		ids := make([]int64, 0)
+		for i := sourceMinId; i <= sourceMaxId; i += chunkSize {
+			sourceTableHash, err := getTableHash(dbSource, tableName, i, i+chunkSize-1)
+			if err != nil {
+				log.Fatalf("Error getting table hash: %v\n", err)
+			}
+
+			targetTableHash, err := getTableHash(dbTarget, tableName, i, i+chunkSize-1)
+			if err != nil {
+				log.Fatalf("Error getting table hash: %v\n", err)
+			}
+
+			if sourceTableHash.Hash != targetTableHash.Hash {
+				ids = append(ids, compareRows(dbSource, dbTarget, tableName, i, i+chunkSize-1)...)
+			}
 		}
+		fmt.Printf("%d rows for table %s differ\n", len(ids), tableName)
 	}
+
 }
