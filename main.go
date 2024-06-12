@@ -2,14 +2,14 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"fmt"
+	_ "github.com/go-sql-driver/mysql"
 	"log"
 	"strings"
-
-	_ "github.com/go-sql-driver/mysql"
 )
 
-func getColumnNames(db *sql.DB, tableName string) ([]string, error) {
+func getColumnNames(db *sql.DB, tableName string, includedColumns []string, excludedColumns []string) ([]string, error) {
 	query := fmt.Sprintf("SHOW COLUMNS FROM %s", tableName)
 	rows, err := db.Query(query)
 	if err != nil {
@@ -32,6 +32,34 @@ func getColumnNames(db *sql.DB, tableName string) ([]string, error) {
 		columns = append(columns, field.String)
 	}
 
+	if len(includedColumns) > 0 {
+		var filteredColumns []string
+		for _, column := range columns {
+			for _, includedColumn := range includedColumns {
+				if column == includedColumn {
+					filteredColumns = append(filteredColumns, column)
+				}
+			}
+		}
+		columns = filteredColumns
+	}
+
+	if len(excludedColumns) > 0 {
+		var filteredColumns []string
+		for _, column := range columns {
+			exclude := false
+			for _, excludedColumn := range excludedColumns {
+				if column == excludedColumn {
+					exclude = true
+				}
+			}
+			if !exclude {
+				filteredColumns = append(filteredColumns, column)
+			}
+		}
+		columns = filteredColumns
+	}
+
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
@@ -39,9 +67,14 @@ func getColumnNames(db *sql.DB, tableName string) ([]string, error) {
 	return columns, nil
 }
 
-type TableHash struct {
+type ChunkHash struct {
 	Count int
 	Hash  string
+}
+
+type TableInfo struct {
+	TableName string
+	Columns   []string
 }
 
 func getMinMax(db *sql.DB, name string) (int64, int64, error) {
@@ -55,13 +88,7 @@ func getMinMax(db *sql.DB, name string) (int64, int64, error) {
 	return minId, maxId, nil
 }
 
-func getTableHash(db *sql.DB, tableName string, minId int64, maxId int64) (*TableHash, error) {
-	columns, err := getColumnNames(db, tableName)
-	if err != nil {
-		return nil, err
-	}
-
-	concatColumns := strings.Join(columns, ", ")
+func getChunkHash(db *sql.DB, tableInfo *TableInfo, minId int64, maxId int64) (*ChunkHash, error) {
 	newQuery := fmt.Sprintf(`
 		SELECT 
 			COUNT(*),
@@ -69,37 +96,27 @@ func getTableHash(db *sql.DB, tableName string, minId int64, maxId int64) (*Tabl
 		FROM %s
 		WHERE id >= %d AND id <= %d
 		ORDER BY id
-		`, concatColumns, tableName, minId, maxId)
+		`, strings.Join(tableInfo.Columns, ","), tableInfo.TableName, minId, maxId)
 
 	resultRow := db.QueryRow(newQuery)
 	var count int
 	var hash string
-	err = resultRow.Scan(&count, &hash)
+	err := resultRow.Scan(&count, &hash)
 	if err != nil {
 		return nil, err
 	}
-	return &TableHash{Count: count, Hash: hash}, nil
+	return &ChunkHash{Count: count, Hash: hash}, nil
 }
 
-func NewDb(name string) (*sql.DB, error) {
-	dbUser := "root"
-	dbPass := "lucapette"
-	dbHost := "localhost"
-	dbPort := "3306"
-
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPass, dbHost, dbPort, name)
-
+func NewDb(dsn string) (*sql.DB, error) {
 	return sql.Open("mysql", dsn)
 }
 
-func compareRows(dbSource *sql.DB, dbTarget *sql.DB, tableName string, minId int64, maxId int64) []int64 {
-	columns, err := getColumnNames(dbSource, tableName)
-	if err != nil {
-		log.Fatalf("Error getting column names: %v\n", err)
-	}
+func compareRows(dbSource *sql.DB, dbTarget *sql.DB, tableInfo *TableInfo, minId int64, maxId int64) []int64 {
+	query := fmt.Sprintf(
+		`SELECT id, CAST(CONV(SUBSTRING(MD5(CONCAT_WS(%s)), 18), 16, 10) AS UNSIGNED) AS hash FROM %s WHERE id >= %d AND id <= %d`,
+		strings.Join(tableInfo.Columns, ","), tableInfo.TableName, minId, maxId)
 
-	concatColumns := strings.Join(columns, ", ")
-	query := fmt.Sprintf("SELECT id, CAST(CONV(SUBSTRING(MD5(CONCAT_WS(%s)), 18), 16, 10) AS UNSIGNED) AS hash FROM %s WHERE id >= %d AND id <= %d", concatColumns, tableName, minId, maxId)
 	sourceRows, err := dbSource.Query(query)
 	if err != nil {
 		log.Fatalf("Error querying the database: %v\n", err)
@@ -156,7 +173,23 @@ func compareRows(dbSource *sql.DB, dbTarget *sql.DB, tableName string, minId int
 }
 
 func main() {
-	dbSource, err := NewDb("ribosom")
+	var source = flag.String("source", "", "Source database connection string")
+	var target = flag.String("target", "", "Target database connection string")
+	var tableName = flag.String("table", "", "Table name to compare")
+	var excludeColumns = flag.String("exclude", "", "Comma separated list of columns to exclude from comparison")
+	var includeColumns = flag.String("include", "", "Comma separated list of columns to include in comparison")
+
+	flag.Parse()
+
+	if *source == "" || *target == "" || *tableName == "" {
+		log.Fatalf("source, target and table are required\n")
+	}
+
+	if *includeColumns != "" && *excludeColumns != "" {
+		log.Fatalf("include and exclude can't be used together\n")
+	}
+
+	dbSource, err := NewDb(*source)
 	if err != nil {
 		log.Fatalf("Error connecting to the database: %v\n", err)
 	}
@@ -171,7 +204,8 @@ func main() {
 	if err := dbSource.Ping(); err != nil {
 		log.Fatalf("Error connecting to the database: %v\n", err)
 	}
-	dbTarget, err := NewDb("ribosom_sync")
+
+	dbTarget, err := NewDb(*target)
 	if err != nil {
 		log.Fatalf("Error connecting to the database: %v\n", err)
 	}
@@ -187,33 +221,37 @@ func main() {
 		log.Fatalf("Error connecting to the database: %v\n", err)
 	}
 
-	tableNames := []string{"reference"}
+	var chunkSize int64 = 10000
 
-	for _, tableName := range tableNames {
-		var chunkSize int64 = 10000
+	tableColumns, err := getColumnNames(dbSource, *tableName, strings.Split(*includeColumns, ","), strings.Split(*excludeColumns, ","))
+	if err != nil {
+		log.Fatalf("Error getting column names: %v\n", err)
+	}
+	tableInfo := &TableInfo{TableName: *tableName, Columns: tableColumns}
 
-		sourceMinId, sourceMaxId, err := getMinMax(dbSource, tableName)
-		if err != nil {
-			log.Fatalf("Error getting min and max id: %v\n", err)
-		}
-
-		ids := make([]int64, 0)
-		for i := sourceMinId; i <= sourceMaxId; i += chunkSize {
-			sourceTableHash, err := getTableHash(dbSource, tableName, i, i+chunkSize-1)
-			if err != nil {
-				log.Fatalf("Error getting table hash: %v\n", err)
-			}
-
-			targetTableHash, err := getTableHash(dbTarget, tableName, i, i+chunkSize-1)
-			if err != nil {
-				log.Fatalf("Error getting table hash: %v\n", err)
-			}
-
-			if sourceTableHash.Hash != targetTableHash.Hash {
-				ids = append(ids, compareRows(dbSource, dbTarget, tableName, i, i+chunkSize-1)...)
-			}
-		}
-		fmt.Printf("%d rows for table %s differ\n", len(ids), tableName)
+	sourceMinId, sourceMaxId, err := getMinMax(dbSource, *tableName)
+	if err != nil {
+		log.Fatalf("Error getting min and max id: %v\n", err)
 	}
 
+	ids := make([]int64, 0)
+	for i := sourceMinId; i <= sourceMaxId; i += chunkSize {
+		sourceTableHash, err := getChunkHash(dbSource, tableInfo, i, i+chunkSize-1)
+		if err != nil {
+			log.Fatalf("Error getting table hash: %v\n", err)
+		}
+
+		targetTableHash, err := getChunkHash(dbTarget, tableInfo, i, i+chunkSize-1)
+		if err != nil {
+			log.Fatalf("Error getting table hash: %v\n", err)
+		}
+
+		if sourceTableHash.Hash != targetTableHash.Hash {
+			ids = append(ids, compareRows(dbSource, dbTarget, tableInfo, i, i+chunkSize-1)...)
+		}
+	}
+
+	if len(ids) > 0 {
+		fmt.Printf("%d rows for table %s differ\n", len(ids), *tableName)
+	}
 }
