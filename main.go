@@ -176,8 +176,8 @@ func main() {
 	var source = flag.String("source", "", "Source database connection string")
 	var target = flag.String("target", "", "Target database connection string")
 	var tableName = flag.String("table", "", "Table name to compare")
-	var excludeColumns = flag.String("exclude", "", "Comma separated list of columns to exclude from comparison")
-	var includeColumns = flag.String("include", "", "Comma separated list of columns to include in comparison")
+	var exclude = flag.String("exclude", "", "Comma separated list of columns to exclude from comparison")
+	var include = flag.String("include", "", "Comma separated list of columns to include in comparison")
 
 	flag.Parse()
 
@@ -185,7 +185,7 @@ func main() {
 		log.Fatalf("source, target and table are required\n")
 	}
 
-	if *includeColumns != "" && *excludeColumns != "" {
+	if *include != "" && *exclude != "" {
 		log.Fatalf("include and exclude can't be used together\n")
 	}
 
@@ -223,7 +223,18 @@ func main() {
 
 	var chunkSize int64 = 10000
 
-	tableColumns, err := getColumnNames(dbSource, *tableName, strings.Split(*includeColumns, ","), strings.Split(*excludeColumns, ","))
+	var includeColumns []string
+
+	if *include != "" {
+		includeColumns = strings.Split(*include, ",")
+	}
+
+	var excludeColumns []string
+	if *exclude != "" {
+		excludeColumns = strings.Split(*exclude, ",")
+	}
+
+	tableColumns, err := getColumnNames(dbSource, *tableName, includeColumns, excludeColumns)
 	if err != nil {
 		log.Fatalf("Error getting column names: %v\n", err)
 	}
