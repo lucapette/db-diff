@@ -1,7 +1,6 @@
 # DB diff
 
-soon ™
-
+soon ™ with an actual readme. It's just a little experiment for now.
 
 example usage:
 
